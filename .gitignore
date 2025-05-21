@@ -3,7 +3,10 @@ data/
 figs/
 
 checkpoints/
+# macOS system files
+.DS_Store
 
-.DS_store/
-
+# Python cache directories
 __pycache__/
+*.py[cod]
+*$py.class
