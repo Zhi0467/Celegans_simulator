@@ -11,8 +11,8 @@ Data folder is not provided in this repo as it'll be too chunky, you can downloa
     ```bash
     pip install -r requirements.txt
     ```
-    Key libraries include `torch`, `numpy`, `pandas`, `scikit-learn`, `matplotlib`, `plotly`, `tqdm`, and `torchdiffeq`.
-3.  **Data**:
+    Key libraries include `torch`, `numpy`, `pandas`, `scikit-learn`, `matplotlib`, `plotly`, and `tqdm`.
+3.  **Data (not included in the repo to keep it slim)**:
     * Neural activity data (e.g., `IDs.xlsx`, `traces.xlsx`, `tracesDif.xlsx`, `fps.xlsx`) should be placed in a directory specified by `data_dir` in the `config` (default: `data/activity/WT_NoStim/`).
     * Connectome data (e.g., `connectome_EJ.csv`, `Celeganconnect.xls`) should be in a directory specified by `connectome_path` (default: `data/connectome/White1986/`).
 
