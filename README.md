@@ -1,10 +1,12 @@
-# C. elegans Neural Dynamics Training Pipeline
+# Neural Simulators 
+
+## C. elegans Neural Dynamics Training Pipeline
 
 This project provides a pipeline to train and evaluate models of C. elegans neural dynamics. The `main.py` script is the primary entry point for orchestrating the training process, comparing models with and without connectome-based constraints, and generating post-training visualizations.
 
 Data folder is not provided in this repo as it'll be too chunky, you can download from original White and Zimmer paper or ask me for it.
 
-## Prerequisites
+### Prerequisites
 
 1.  **Python Environment**: Ensure you have a Python environment (e.g., Python 3.8+) set up.
 2.  **Dependencies**: Install the necessary Python packages. You can typically do this using a `requirements.txt` file (if provided) with pip:
@@ -16,7 +18,7 @@ Data folder is not provided in this repo as it'll be too chunky, you can downloa
     * Neural activity data (e.g., `IDs.xlsx`, `traces.xlsx`, `tracesDif.xlsx`, `fps.xlsx`) should be placed in a directory specified by `data_dir` in the `config` (default: `data/activity/WT_NoStim/`).
     * Connectome data (e.g., `connectome_EJ.csv`, `Celeganconnect.xls`) should be in a directory specified by `connectome_path` (default: `data/connectome/White1986/`).
 
-## Configuration
+### Configuration
 
 Parameters for the training pipeline are primarily configured within the `main()` function in `main.py`.
 
@@ -37,7 +39,7 @@ Further detailed hyperparameters are located in the `config` dictionary within `
 * `beta_init`, `tau_init`, `noise_init`, `synaptic_gain_init`: Initial parameters for the neural dynamics model.
 * `run_avg_loss_vis`, `run_avg_pc_vis`: Booleans to enable/disable post-training average loss and PC trajectory visualizations.
 
-## Running the Script
+### Running the Script
 
 To run the training pipeline, execute `main.py` from your terminal:
 

@@ -569,119 +569,148 @@ class LinearDynamics(ODESimulator):
         # if 'beta_cubic' in checkpoint: self.beta_cubic = checkpoint['beta_cubic']
         print(f"Model loaded from {path}")
 
-class SpikeSimulator(ODESimulator):
+class FiringRateSimulator(ODESimulator):
     def __init__(self, fish_id='201106',
-                 beta=1.0, tau=1.0,
+                 tau_s_init=1.0,        # Renamed from tau_s_init, now for rate dynamics (tau_r)
+                 bias_init_std=0.1,
+                 bias_init_mean_offset=0.1, # User's value
                  noise_strength=0.01,
-                 weight_scale=2.0,
-                 n_neurons = None):
+                 weight_scale=1.0,
+                 n_neurons = None,
+                 sparsity_factor=0.2): # User's value
         """
-        Initialize the Spike Simulator
+        Initialize the Firing Rate Simulator where firing rate 'v' is the evolving variable.
+        Based on tau_r * dv/dt = -v + F(I_s(t)), where I_s(t) ~ W*v(t) + bias + noise.
         
         Parameters:
-        - fish_id: ID of the fish data to load (default: '201106')
-        - beta: Coupling strength
-        - tau: Time constant
-        - noise_strength: Standard deviation of Gaussian noise
-        - weight_scale: Scale factor for random weight initialization
+        - fish_id: ID of the fish data to load.
+        - tau_r_init: Initial scalar value for firing rate time constants (tau_r).
+        - bias_init_std: Standard deviation for initializing neuron biases.
+        - bias_init_mean_offset: Mean offset for initializing neuron biases.
+        - noise_strength: Standard deviation of Gaussian noise.
+        - weight_scale: Scale factor (gain) for Xavier weight initialization of W.
+        - n_neurons: Expected number of neurons.
+        - sparsity_factor: Fraction of non-zero connections in W.
         """
-        # Load fish spike data to get number of neurons
-        spike_data = load_fish_spike_data(ifish=fish_id, n_neurons=n_neurons)
-        n_units = spike_data.shape[0]  # Number of neurons from spike data
-        
-        # Initialize base class without connectome
         super().__init__(connectome_path=None)
+
+        try:
+            spike_data_loaded = load_fish_spike_data(ifish=fish_id, n_neurons=n_neurons)
+        except TypeError:
+            print(f"Warning: load_fish_spike_data may not accept n_neurons. Calling without it.")
+            spike_data_loaded = load_fish_spike_data(ifish=fish_id)
+        current_n_units = spike_data_loaded.shape[0]
+
+        if n_neurons is not None and n_neurons != current_n_units:
+            print(f"Warning: n_neurons ({n_neurons}) != loaded ({current_n_units}). Using {current_n_units}.")
+        self.n_units = current_n_units
         
-        # Override n_units from base class
-        self.n_units = n_units
-        
-        self.log_beta = nn.Parameter(torch.log(torch.tensor(beta, device=self.device)))
-        self.tau = nn.Parameter(torch.tensor(tau, dtype=torch.float32, device=self.device))
+        # Neuron-specific time constants for firing rate dynamics (tau_r)
+        self.taus_r = nn.Parameter(torch.full((self.n_units,), tau_s_init, dtype=torch.float32))
+        # Neuron-specific biases that contribute to the input of activation function F
+        initial_biases = torch.randn(self.n_units, dtype=torch.float32) * bias_init_std + bias_init_mean_offset
+        self.input_biases = nn.Parameter(initial_biases) # Renamed from output_biases for clarity
+
         self.noise_strength = noise_strength
         
-        # Initialize synaptic weights randomly
-        # Using Xavier/Glorot initialization scaled by weight_scale
-        self.W = nn.Linear(self.n_units, self.n_units, bias=False).to(self.device)
-        nn.init.xavier_normal_(self.W.weight, gain=weight_scale)
+        # Synaptic weights W
+        self.W = nn.Linear(self.n_units, self.n_units, bias=False)
+        nn.init.xavier_normal_(self.W.weight.data, gain=weight_scale) 
         
-        # Store spike data for reference
-        self.spike_data = spike_data
-    
-    @property
-    def beta(self):
-        return torch.exp(self.log_beta)
-    
-    def sigma(self, x):
-        """Sigmoid activation function"""
-        return torch.relu(x)
-    
-    def ode_func(self, t, x):
-        """
-        Compute dx/dt for the spike-based system
-        """
-        if len(x.shape) == 1:
-            x = x.unsqueeze(0)
-        
-        # Compute synaptic input
-        synaptic_input = self.W(x)
-        
-        # Add noise if enabled
-        if self.noise_strength > 0:
-            noise = torch.randn_like(x) * self.noise_strength
-            synaptic_input = synaptic_input + noise
-        
-        # Compute membrane potential dynamics
-        dxdt = (-x + self.beta * self.sigma(synaptic_input)) / self.tau
+        if 0.0 <= sparsity_factor <= 1.0:
+            mask = torch.rand_like(self.W.weight.data) < sparsity_factor
+            self.W.weight.data *= mask.float()
+            actual_density = torch.sum(mask).item() / (self.W.weight.data.numel() or 1)
+            print(f"Applied sparsity to W: target density {sparsity_factor:.2f}, actual density {actual_density:.4f}")
+        else:
+            raise ValueError("sparsity_factor must be between 0.0 and 1.0.")
 
-        dxdt = torch.clamp(dxdt, min=-1.0, max=1.0)
+        self.to(self.device)
+
+    def F_activation(self, effective_current_like_input_batch):
+        """
+        Activation function F(I_s(t)) that converts total effective input to a target rate.
+        Represents F(input) = ReLU(input).
+        Input effective_current_like_input_batch shape: (batch_size, n_units)
+        Output shape: (batch_size, n_units)
+        """
+        return torch.relu(effective_current_like_input_batch)
+
+    def ode_func(self, t, current_rates_v_batch):
+        """
+        Compute dv/dt for the firing rate dynamics.
+        current_rates_v_batch: current firing rates of neurons (batch_size, n_units).
+        Equation: tau_r * dv/dt = -v + F(W*v + bias + noise)
+        """
+        if len(current_rates_v_batch.shape) == 1: # Add batch dimension if missing
+            current_rates_v_batch = current_rates_v_batch.unsqueeze(0)
         
-        return dxdt
+        # 1. Calculate total weighted presynaptic input W*v
+        w_dot_v = self.W(current_rates_v_batch) # Shape: (batch_size, n_units)
+        
+        # 2. Add neuron-specific biases
+        # input_biases is (n_units,), unsqueeze to (1, n_units) for broadcasting
+        effective_current_like_input = w_dot_v + self.input_biases.unsqueeze(0)
+        
+        # 3. Add noise (optional)
+        if self.noise_strength > 0:
+            noise = torch.randn_like(effective_current_like_input) * self.noise_strength
+            effective_current_like_input = effective_current_like_input + noise
+        
+        # 4. Apply activation function F
+        F_output = self.F_activation(effective_current_like_input) # Shape: (batch_size, n_units)
+        
+        # 5. Compute dv/dt
+        # taus_r is (n_units,), unsqueeze to (1, n_units) for broadcasting
+        dv_dt_batch = (-current_rates_v_batch + F_output) / (self.taus_r.unsqueeze(0) + 1e-6)
+        
+        return dv_dt_batch
     
     def simulate(self, t_span=None, x0=None, time_steps=None):
         """
-        Simulate the dynamics using Euler integration
+        Simulate the dynamics of firing rates v(t) using Euler integration.
+        Returns time points and the history of firing rates v(t).
+        x0_rates: Initial condition for firing rates v0 (batch_size, n_units) or (n_units,).
+                  If None, rates are initialized to small random positive values.
         """
+        if t_span is None or time_steps is None:
+            raise ValueError("t_span and time_steps must be provided for simulation.")
+
         if x0 is None:
-            # Initialize x0 uniformly between -1 and 1
-            x0 = 2 * torch.rand(1, self.n_units, device=self.device) - 1
+            # Initialize firing rates v0 to small random positive values
+            current_rates_v_batch = torch.rand(1, self.n_units, device=self.device, dtype=self.W.weight.dtype) * 0.1 
+        else:
+            current_rates_v_batch = x0.to(self.device, dtype=self.W.weight.dtype)
+            if len(current_rates_v_batch.shape) == 1:
+                current_rates_v_batch = current_rates_v_batch.unsqueeze(0) # Add batch dim
         
-        # Ensure x0 has batch dimension
-        if len(x0.shape) == 1:
-            x0 = x0.unsqueeze(0)
+        # Ensure initial rates are non-negative
+        current_rates_v_batch = torch.relu(current_rates_v_batch) 
         
-        # Use explicit time_steps if provided, otherwise calculate from t_span and alpha
-        if time_steps is None:
-            return None
-        
-        # Generate evenly spaced time points - exactly time_steps points
         t = torch.linspace(t_span[0], t_span[1], time_steps, device=self.device)
-        step_size = (t[1] - t[0]).item() 
+        step_size = (t[1] - t[0]).item() if time_steps > 1 else (t_span[1] - t_span[0])
+        if step_size == 0 and time_steps > 1:
+             step_size = 1.0 / (time_steps - 1) if time_steps > 1 else 1.0
 
-        states_list = [x0]
-        current_state = x0
+        firing_rates_history_v = [current_rates_v_batch.clone()] # Store initial rates
 
-        # Euler integration loop
         for i in range(time_steps - 1):
-            # Calculate derivative using the *current* state
-            dxdt = self.ode_func(t[i], current_state) 
+            dv_dt = self.ode_func(t[i], current_rates_v_batch) 
+            next_rates_v_tentative = current_rates_v_batch + step_size * dv_dt 
+            
+            # Ensure firing rates remain non-negative after Euler step
+            current_rates_v_batch = torch.relu(next_rates_v_tentative)
 
-            # Calculate the *next* state without modifying the list or current_state yet
-            next_state = current_state + step_size * dxdt 
-
-            # Check for NaN values and handle them (replace with previous state)
-            if torch.isnan(next_state).any():
-                print(f"NaN detected at simulation step {i+1}. Replacing with previous state.")
-                # Keep current_state as next_state effectively
-                next_state = current_state
-
-            # Append the newly computed state to the list
-            states_list.append(next_state)
-            # Update current_state for the next iteration
-            current_state = next_state
-
-        states = torch.stack(states_list, dim=0)
-        return t, states
-
+            if torch.isnan(current_rates_v_batch).any():
+                print(f"NaN detected in rates at simulation step {i+1}. Using previous rates.")
+                # Revert to previous state if NaN occurs
+                # Note: if the first step results in NaN, history has only one element.
+                current_rates_v_batch = firing_rates_history_v[-1].clone() 
+            
+            firing_rates_history_v.append(current_rates_v_batch.clone())
+        
+        output_firing_rates_v = torch.stack(firing_rates_history_v, dim=0) 
+        return t, output_firing_rates_v 
 class KatoDataset(torch.utils.data.Dataset):
     """Dataset class for Kato et al. neural activity data"""
     def __init__(self, sequence_length, n_units, alpha, zoomin_factor = None, normalize=True, sheet_name = 0):

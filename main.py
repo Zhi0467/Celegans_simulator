@@ -173,14 +173,18 @@ def run_spike_covariance_experiment():
     # Parameters for the SpikeCovarianceModel experiment
     fish_id = '201106'  # Example fish ID, ensure data exists for this ID
     fish_figs_dir = 'fish-figs/'
-    sequence_length = 1000 # Number of timepoints for simulation and target data
+    sequence_length = 500 # Number of timepoints for simulation and target data
     n_neurons = None
-    learning_rate = 5e-2 # Adjusted learning rate
+    learning_rate = 1e-3 # Adjusted learning rate
+    lambda_activity = 1e-5
     num_epochs = 200
+    start_time = 0.0
+    end_time = sequence_length / 10.0
 
-    beta_init = 1.0
+
     tau_init = 1.0
-    noise_strength = 1e-3 
+    bias_init_std = 0.5
+    noise_strength = 1e-2
     weight_scale = 2.0
 
     print(f"Experiment Parameters:")
@@ -189,7 +193,7 @@ def run_spike_covariance_experiment():
     print(f"  Number of Neurons: {n_neurons}")
     print(f"  Learning Rate: {learning_rate}")
     print(f"  Epochs: {num_epochs}")
-    print(f"  Beta Init: {beta_init}, Tau Init: {tau_init}, Noise: {noise_strength}")
+    print(f"  Bias Init Std: {bias_init_std}, Tau Init: {tau_init}, Lambda: {lambda_activity}, Noise: {noise_strength}")
     print("-" * 30)
 
     # Instantiate the SpikeCovarianceModel
@@ -197,15 +201,24 @@ def run_spike_covariance_experiment():
         model = SpikeCovarianceModel(
             fish_id=fish_id,
             sequence_length=sequence_length,
-            beta_init=beta_init,
             tau_init=tau_init,
+            bias_init_std=bias_init_std,
             noise_strength=noise_strength,
             weight_scale=weight_scale,
             learning_rate=learning_rate,
             device=device,
-            n_neurons=n_neurons
+            n_neurons=n_neurons,
+            lambda_activity_mse=lambda_activity
         )
         print("SpikeCovarianceModel instantiated successfully.")
+        # # Example: Plot activity for the first 2 seconds for the first 3 neurons
+        plot_activity_comparison(
+            model=model,
+            start_time_sec=start_time,
+            end_time_sec=end_time,
+            max_neurons_to_plot=25, # Or use this to plot the first N
+            save_path=fish_figs_dir + "activity_comparison_prior.png"
+        )
     except Exception as e:
         print(f"Error instantiating SpikeCovarianceModel: {e}")
         import traceback
@@ -220,6 +233,13 @@ def run_spike_covariance_experiment():
             save_path_prefix=fish_figs_dir
         )
         print("Training finished.")
+        plot_activity_comparison(
+            model=model,
+            start_time_sec=start_time,
+            end_time_sec=end_time,
+            max_neurons_to_plot=25, # Or use this to plot the first N
+            save_path=fish_figs_dir + "activity_comparison_posterior.png"
+        )
 
     except Exception as e:
         print(f"Error during model training: {e}")

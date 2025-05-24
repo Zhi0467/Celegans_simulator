@@ -19,7 +19,7 @@ import torch
 from sklearn.decomposition import PCA
 from torch import nn
 import matplotlib.pyplot as plt
-from simulator import LinearDynamics, SpikeSimulator
+from simulator import LinearDynamics, FiringRateSimulator
 import torch.nn.functional as F
 from load import *
 import torch.optim.lr_scheduler as lr_scheduler
@@ -1503,55 +1503,77 @@ class TrialPCA(nn.Module):
 
 class FishSpikeDataset(torch.utils.data.Dataset):
     """
-    Dataset for loading fish spike data for covariance-based model fitting.
-    Uses load_fish_spike_data from load.py.
+    Dataset for loading fish spike data, with optional Gaussian smoothing.
+    Uses load_fish_spike_data from load.py and local gaussian_smooth.
     """
-    def __init__(self, fish_id='201106', sequence_length=None, device='cpu', n_neurons = None):
+    def __init__(self, fish_id='201106', sequence_length=None, device='cpu', n_neurons=None,
+                 apply_smoothing=True, smooth_sigma=1.5): # Smoothing parameters
         super().__init__()
         self.fish_id = fish_id
         self.device = device
+        self.apply_smoothing = apply_smoothing
+        self.smooth_sigma = smooth_sigma
         
-        # Load data using the function from load.py
-        # load_fish_spike_data returns a numpy array (neurons, timepoints)
         self.raw_spike_data_np = load_fish_spike_data(ifish=self.fish_id, n_neurons=n_neurons)
-        self.n_neurons, self.total_timepoints = self.raw_spike_data_np.shape
+        
+        if self.raw_spike_data_np.ndim == 1:
+            print(f"Warning: Loaded raw_spike_data_np is 1D. Reshaping to (1, {self.raw_spike_data_np.shape[0]})")
+            self.raw_spike_data_np = self.raw_spike_data_np.reshape(1, -1)
+        
+        loaded_n_neurons, self.total_timepoints = self.raw_spike_data_np.shape
+
+        if n_neurons is not None and n_neurons != loaded_n_neurons:
+            print(f"Warning: Requested n_neurons ({n_neurons}) differs from loaded data ({loaded_n_neurons}). "
+                  f"Using {loaded_n_neurons} neurons from loaded data.")
+        self.n_neurons = loaded_n_neurons
 
         if sequence_length is None:
             self.sequence_length = self.total_timepoints
         else:
             self.sequence_length = min(sequence_length, self.total_timepoints)
 
-        # Use the first 'sequence_length' timepoints
-        self.spike_data_np = self.raw_spike_data_np[:, :self.sequence_length]
-        self.spike_data = torch.tensor(self.spike_data_np, dtype=torch.float32, device=self.device)
+        current_spike_data_np = self.raw_spike_data_np[:, :self.sequence_length]
 
-        self.x0 = torch.zeros(1, self.n_neurons, dtype=torch.float32, device=device)
-        for i in range(self.n_neurons):
-            self.x0[0, i] = self.spike_data[i, 0]
+        # Convert to tensor before potential smoothing
+        self.spike_data = torch.tensor(current_spike_data_np, dtype=torch.float32, device=self.device)
+
+        if self.apply_smoothing and self.smooth_sigma > 0:
+            print(f"Applying Gaussian smoothing with sigma={self.smooth_sigma} to target data.")
+            # The gaussian_smooth function (defined above or imported) should take a tensor
+            self.spike_data = gaussian_smooth(self.spike_data, sigma=self.smooth_sigma)
+        
+        # self.spike_data_np is for convenience if numpy version is needed elsewhere,
+        # but self.spike_data is the primary data store for the dataset.
+        self.spike_data_np = self.spike_data.cpu().numpy() 
+
+        self.x0 = torch.zeros(1, self.n_neurons, dtype=torch.float32, device=self.device)
+        if self.n_neurons > 0 and self.spike_data.shape[1] > 0:
+            for i in range(self.n_neurons):
+                self.x0[0, i] = self.spike_data[i, 0]
 
     def __len__(self):
-        # This dataset handles a single sequence chunk.
         return 1
 
     def __getitem__(self, idx):
-        # Returns the spike data chunk: (neurons, timepoints)
         if idx >= 1:
             raise IndexError("This dataset currently only supports a single sequence chunk.")
         return self.spike_data
 
     def get_full_data(self):
-        """Helper to get the processed spike data tensor."""
         return self.spike_data
-
+    
 class SpikeCovarianceModel(nn.Module):
     """
-    A minimal model that wraps SpikeSimulator and trains its parameters
-    by fitting the covariance matrix of simulated spike activity to a target
-    covariance matrix derived from fish spike data.
+    A minimal model that wraps FiringRateSimulator and trains its parameters
+    by fitting the covariance matrix and optionally the neural activity MSE
+    of simulated spike activity to a target derived from fish spike data.
     """
     def __init__(self, fish_id='201106', sequence_length=1000,
-                 beta_init=1.0, tau_init=5.0, noise_strength=0.1, weight_scale=1.0,
-                 learning_rate=0.01, device=None, n_neurons = None):
+                 tau_init=5.0, bias_init_std = 0.5, noise_strength=0.1, weight_scale=1.0,
+                 learning_rate=0.01, device=None, n_neurons=None,
+                 lambda_activity_mse=0.1,
+                 activity_spike_weight=10.0, # Weight for spike periods in activity MSE
+                 activity_spike_threshold=1e-2): # New lambda for activity MSE
         super().__init__()
 
         if device is None:
@@ -1563,10 +1585,9 @@ class SpikeCovarianceModel(nn.Module):
         print(f"SpikeCovarianceModel using device: {self.device}")
 
         self.fish_id = fish_id
-        # sequence_length determines the number of time points for simulation and target data
         self.sequence_length = sequence_length 
+        self.lambda_activity_mse = lambda_activity_mse # Store lambda
 
-        # Initialize dataset
         self.dataset = FishSpikeDataset(fish_id=self.fish_id,
                                         sequence_length=self.sequence_length,
                                         device=self.device,
@@ -1574,136 +1595,167 @@ class SpikeCovarianceModel(nn.Module):
         
         self.n_neurons = self.dataset.n_neurons
 
-        self.simulator = SpikeSimulator(fish_id=self.fish_id,
-                                        beta=beta_init,
-                                        tau=tau_init,
-                                        noise_strength=noise_strength,
-                                        weight_scale=weight_scale,
-                                        n_neurons=n_neurons).to(self.device)
+        self.simulator = FiringRateSimulator(fish_id=fish_id,
+                                            tau_s_init=tau_init,      
+                                            bias_init_std= bias_init_std, 
+                                            noise_strength=noise_strength,
+                                            weight_scale=weight_scale,      
+                                            n_neurons = n_neurons).to(self.device)
         
-        # Validate neuron count consistency
         if self.simulator.n_units != self.n_neurons:
             raise ValueError(
                 f"Mismatch in neuron count: Dataset has {self.n_neurons}, "
-                f"Simulator (from fish_id {self.fish_id}) initialized with {self.simulator.n_units}."
+                f"Simulator n_units is {self.simulator.n_units}."
             )
 
-        # Get target spike data and pre-calculate target covariance matrix
-        self.target_spikes_N_T = self.dataset.get_full_data() # Shape: (n_neurons, sequence_length)
-        self.target_cov = self._calculate_covariance(self.target_spikes_N_T)
-        self.target_corr = self._calculate_correlation(self.target_spikes_N_T)
+        self.target_spikes_N_T = self.dataset.get_full_data() 
+        # Using _calculate_covariance for the primary "covariance" loss term's target
+        self.target_cov = self._calculate_covariance(self.target_spikes_N_T) 
+        # Using _calculate_correlation for heatmap plotting target
+        self.target_corr_np = self._calculate_correlation(self.target_spikes_N_T) 
+        target_corr = torch.from_numpy(self.target_corr_np)
+        self.target_corr = target_corr.to(device).float()
 
-        # Optimizer for the simulator's parameters
         self.optimizer = torch.optim.Adam(self.simulator.parameters(), lr=learning_rate)
 
+        self.weights_activity = torch.ones_like(self.target_spikes_N_T)
+        self.weights_activity[self.target_spikes_N_T > activity_spike_threshold] = activity_spike_weight
+
     def forward(self, x0_N=None, t_span=None, fps = 10.0):
-        """
-        Runs the simulation using the SpikeSimulator.
-
-        Args:
-            x0_N (Tensor, optional): Initial condition for neurons. Shape (n_neurons,).
-                                     If None, simulator's default is used.
-            t_span (tuple, optional): (start_time, end_time) for simulation.
-            time_steps (int, optional): Number of simulation steps.
-
-        Returns:
-            Tensor: Simulated spike states from the simulator. Shape (time_steps, batch_size, n_neurons).
-        """
         if x0_N is not None:
-            # Add batch dimension for simulator: (1, n_neurons)
             x0_sim = x0_N.unsqueeze(0).to(self.device) 
         else:
-            x0_sim = None # SpikeSimulator handles default x0 if None
+            x0_sim = None 
 
         time_steps = self.sequence_length
-
         t_start = 0.0
-        t_end = time_steps / fps
-        t_span = (t_start, t_end) 
+        t_end = time_steps / fps if fps > 0 else time_steps
         
-        # SpikeSimulator.simulate returns t, states
-        # states shape: (time_steps, batch_size, n_units)
-        _t, simulated_spikes_T_B_N = self.simulator.simulate(t_span=t_span,
+        if t_span is None:
+            current_t_span = (t_start, t_end) 
+        else:
+            current_t_span = t_span
+        
+        _t, simulation = self.simulator.simulate(t_span=current_t_span,
                                                              x0=x0_sim,
                                                              time_steps=time_steps)
-        return simulated_spikes_T_B_N
+        return simulation
 
-    def fit(self, save_path_prefix = None, n_epochs=100, x0_N=None):
-        """
-        Trains the model by fitting the simulated covariance to the target covariance.
-
-        Args:
-            n_epochs (int): Number of training epochs.
-            x0_N (Tensor, optional): Initial condition for simulations. Shape (n_neurons,).
-                                     If None, uses the first time point of target data.
-        Returns:
-            dict: Training history containing loss per epoch.
-        """
+    def fit(self, save_path_prefix = None, n_epochs=100, x0_N=None, fps=10.0):
         if x0_N is None:
-            initial_condition_N = self.target_spikes_N_T[:, 0].clone().detach()
+            noise = torch.rand(self.n_neurons, device=self.device) * 0.1 + 0.05
+            initial_condition_N = self.target_spikes_N_T[:, 0] + noise
+            initial_condition_N = initial_condition_N.clone().detach().to(self.device)
         else:
-            initial_condition_N = x0_N.to(self.device) # Ensure it's on the correct device
+            initial_condition_N = x0_N.to(self.device)
 
         self.simulator.eval() 
         with torch.no_grad():
-            sim_spikes_before = self.forward(x0_N=initial_condition_N)
+            sim_spikes_before = self.forward(x0_N=initial_condition_N, fps=fps)
             sim_spikes_before_N_T = sim_spikes_before.squeeze(1).permute(1, 0)
             sim_corr_before_training = self._calculate_correlation(sim_spikes_before_N_T)
 
         self.train()
         self.simulator.train()
-        training_history = {'loss': []}
+        
+        # Initialize training_history with gradient norm lists
+        training_history = {
+            'total_loss': [], 'cov_loss': [], 'activity_mse_loss': [],
+            'grad_norm_W_weight': [], 'grad_norm_activation_bias': [],
+            'grad_norm_taus': []
+            # Add other params if FiringRateSimulator has more, e.g. for custom activation
+        }
+        # Fallback for params that might not exist in all FiringRateSimulator versions
+        sim_params_to_monitor = {
+            'W.weight': 'grad_norm_W_weight',
+            'taus_s': 'grad_norm_taus',
+            'input_biases': 'grad_norm_activation_bias'
+        }
+        for key_hist in sim_params_to_monitor.values():
+            if key_hist not in training_history: # Ensure all keys exist
+                 training_history[key_hist] = []
+
 
         for epoch in range(n_epochs):
             self.optimizer.zero_grad()
-
-            # Run simulation
-            simulated_spikes_T_B_N = self.forward(x0_N=initial_condition_N)
-            
+            simulated_spikes_T_B_N = self.forward(x0_N=initial_condition_N, fps=fps)
             simulated_spikes_N_T = simulated_spikes_T_B_N.squeeze(1).permute(1, 0)
 
-            # Calculate covariance of simulated data
             simulated_cov = self._calculate_covariance(simulated_spikes_N_T)
+            loss_cov = F.mse_loss(simulated_cov, self.target_cov)
 
-            # Loss: MSE between target and simulated covariance matrices
-            loss = F.mse_loss(simulated_cov, self.target_cov)
+            squared_errors_activity = (simulated_spikes_N_T - self.target_spikes_N_T)**2
+            loss_activity_mse = torch.mean(self.weights_activity * squared_errors_activity)
 
-            if torch.isnan(loss):
-                print(f"Epoch {epoch+1}: NaN loss detected. Stopping training.")
+            total_loss = loss_cov + self.lambda_activity_mse * loss_activity_mse
+
+            if torch.isnan(total_loss):
+                print(f"Epoch {epoch+1}: NaN total_loss detected. Stopping training.")
                 break 
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.simulator.parameters(), max_norm=1.0)
+            total_loss.backward()
+
+            # Monitor gradients before clipping and optimizer step
+            with torch.no_grad():
+                for name, param in self.simulator.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        hist_key = sim_params_to_monitor.get(name)
+                        if hist_key:
+                            training_history[hist_key].append(grad_norm)
+                        # Optional: print(f"Epoch {epoch+1}, Grad norm {name}: {grad_norm:.2e}")
+                    else: # Parameter might not have grad (e.g., not part of loss, or frozen)
+                        hist_key = sim_params_to_monitor.get(name)
+                        if hist_key:
+                             training_history[hist_key].append(0.0) # Append 0 if no grad or not monitored
+            
+            # Pad history for params not found in this epoch (e.g. if param list changed)
+            # This is a bit tricky if params can change, safer to ensure keys are pre-filled
+            # For now, if a param.grad was None, we append 0.0. If a key from sim_params_to_monitor
+            # was never found in named_parameters, its list might be shorter.
+            # Ensure all grad lists are of same length as loss lists for plotting
+            current_len = len(training_history['total_loss']) # Should be epoch + 1
+            for key_hist in sim_params_to_monitor.values():
+                if len(training_history[key_hist]) < current_len:
+                    training_history[key_hist].append(0.0) # Append 0 if missing for this epoch
+
+
+            # torch.nn.utils.clip_grad_norm_(self.simulator.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-            training_history['loss'].append(loss.item())
-            if (epoch + 1) % 1== 0 or epoch == 0 or epoch == n_epochs -1 :
-                print(f"Epoch {epoch+1}/{n_epochs}, Loss: {loss.item():.12f}")
+            training_history['total_loss'].append(total_loss.item())
+            training_history['cov_loss'].append(loss_cov.item())
+            training_history['activity_mse_loss'].append(self.lambda_activity_mse * loss_activity_mse.item())
+            
+            if (epoch + 1) % 1 == 0 or epoch == 0 or epoch == n_epochs - 1:
+                print(f"Epoch {epoch+1}/{n_epochs}, Total Loss: {total_loss.item():.8f} "
+                      f"(Cov: {loss_cov.item():.8f}, Activity MSE: {self.lambda_activity_mse * loss_activity_mse.item():.8f})")
         
-                
         self.simulator.eval() 
         with torch.no_grad():
-            sim_spikes_after = self.forward(x0_N=initial_condition_N)
+            sim_spikes_after = self.forward(x0_N=initial_condition_N, fps=fps)
             sim_spikes_after_N_T = sim_spikes_after.squeeze(1).permute(1, 0)
             sim_corr_after_training = self._calculate_correlation(sim_spikes_after_N_T)
 
         if save_path_prefix:
             save_dir = Path(save_path_prefix)
+            if '.' in save_dir.name: 
+                save_dir = save_dir.parent
             save_dir.mkdir(parents=True, exist_ok=True)
-            loss_plot_path = str(save_dir / "loss_progression.png")
-            cov_plot_path = str(save_dir / "covariance_heatmaps.png")
+            base_filename = Path(save_path_prefix).name if Path(save_path_prefix).name else f"fish_{self.fish_id}"
+            loss_plot_path = str(save_dir / f"loss_and_grad_progression.png")
+            cov_plot_path = str(save_dir / f"correlation_heatmaps.png")
         else:
             loss_plot_path = None
             cov_plot_path = None
 
-        self.plot_loss_progression(training_history['loss'], save_path=loss_plot_path)
-        self.plot_covariance_heatmaps(
-            actual_cov=self.target_corr, 
+        self.plot_loss_and_gradients(training_history, save_path=loss_plot_path) # Renamed for clarity
+        self.plot_covariance_heatmaps( 
+            actual_cov=self.target_corr_np, 
             sim_cov_before=sim_corr_before_training,
             sim_cov_after=sim_corr_after_training,
             save_path=cov_plot_path
         )
-
         return training_history
 #---------------------------HELPERS----------------------------
     def _calculate_covariance(self, data_N_T):
@@ -1741,27 +1793,99 @@ class SpikeCovarianceModel(nn.Module):
         
         return covariance_matrix.cpu().detach().numpy()
 
-    def plot_loss_progression(self, loss_history, save_path=None):
-        if not loss_history:
-            print("No loss history to plot.")
+    def plot_loss_and_gradients(self, training_history, save_path=None): # Renamed
+        if not training_history or not training_history.get('total_loss'):
+            print("No or incomplete loss/gradient history to plot.")
             return
-        plt.figure(figsize=(10, 6))
-        plt.plot(loss_history, label='Covariance MSE Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title(f'Training Loss Progression (Fish {self.fish_id})')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        try:
-            plt.yscale('log') 
-        except ValueError: pass 
+        
+        num_loss_plots = 3
+        grad_params_to_plot = {
+            'W.weight': 'grad_norm_W_weight',
+            'taus_s': 'grad_norm_taus',
+            'input_biases': 'grad_norm_activation_bias'
+        }
+        # Filter out grad histories that are empty or not present
+        valid_grad_histories = {
+            label_key: training_history[label_key] 
+            for _, label_key in grad_params_to_plot.items() 
+            if training_history.get(label_key) and any(np.isfinite(training_history[label_key]))
+        }
+        num_grad_plots = len(valid_grad_histories)
+
+        if num_grad_plots == 0 and num_loss_plots == 0 :
+            print("No valid loss or gradient data to plot.")
+            return
+
+        total_rows = num_loss_plots + num_grad_plots
+        fig, axes = plt.subplots(total_rows, 1, figsize=(10, 3 * total_rows), sharex=True)
+        if total_rows == 1: # Handle if only one plot ends up being made
+            axes = [axes] 
+        
+        plot_idx = 0
+        epochs = range(1, len(training_history['total_loss']) + 1)
+
+        # Plot Losses
+        loss_components = [
+            ('total_loss', 'Total Loss', 'blue'),
+            ('cov_loss', 'Covariance MSE Loss', 'orange'),
+            ('activity_mse_loss', 'Activity MSE Loss', 'green')
+        ]
+        for key, label, color in loss_components:
+            if plot_idx < total_rows and training_history.get(key) and len(training_history[key]) == len(epochs):
+                ax = axes[plot_idx]
+                ax.plot(epochs, training_history[key], label=label, color=color)
+                ax.set_ylabel('Loss')
+                ax.set_title(label)
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                if any(l > 0 for l in training_history[key]):
+                    try: ax.set_yscale('log')
+                    except ValueError: pass
+                plot_idx += 1
+            elif plot_idx < total_rows : # still create axis but mark N/A
+                axes[plot_idx].text(0.5, 0.5, f'{label} N/A', ha='center', va='center', transform=axes[plot_idx].transAxes)
+                axes[plot_idx].set_title(label)
+                plot_idx +=1
+
+
+        # Plot Gradient Norms
+        grad_colors = ['purple', 'red', 'teal', 'brown']
+        color_idx = 0
+        for param_display_name, hist_key in grad_params_to_plot.items():
+            if plot_idx < total_rows and hist_key in valid_grad_histories and len(valid_grad_histories[hist_key]) == len(epochs):
+                ax = axes[plot_idx]
+                # Filter out potential NaNs if any for plotting grad norms
+                valid_grad_data = [g if np.isfinite(g) else np.nan for g in valid_grad_histories[hist_key]]
+                ax.plot(epochs, valid_grad_data, label=f'Grad Norm ({param_display_name})', color=grad_colors[color_idx % len(grad_colors)])
+                ax.set_ylabel('Gradient Norm')
+                ax.set_title(f'Gradient Norm ({param_display_name})')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                # Check for positive values before log scale, handle empty or all-zero lists
+                if any(g > 1e-10 for g in valid_grad_data if np.isfinite(g)): # check for any positive value
+                    try: ax.set_yscale('log')
+                    except ValueError: pass
+                plot_idx += 1
+                color_idx += 1
+            elif plot_idx < total_rows : # still create axis but mark N/A
+                axes[plot_idx].text(0.5, 0.5, f'Grad Norm ({param_display_name}) N/A', ha='center', va='center', transform=axes[plot_idx].transAxes)
+                axes[plot_idx].set_title(f'Gradient Norm ({param_display_name})')
+
+                plot_idx +=1
+        
+        if plot_idx > 0 : # Only add xlabel if any plots were made
+            axes[plot_idx-1].set_xlabel('Epoch') # X-label for the last actual plot
+
+        fig.suptitle(f'Training Diagnostics (Fish {self.fish_id})', fontsize=14)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
         if save_path:
-            plt.savefig(save_path)
-            print(f"Loss progression plot saved to {save_path}")
-            plt.close()
+            plt.savefig(save_path, dpi=150)
+            print(f"Loss and gradient progression plot saved to {save_path}")
+            plt.close(fig)
         else:
             plt.show()
-
+    
     def plot_covariance_heatmaps(self, actual_cov, sim_cov_before, sim_cov_after, save_path=None):
             """
             Plots three neural covariance matrices as heatmaps in a single figure.
@@ -2452,3 +2576,159 @@ def compare_constrain(
 
     print(f"===== Comparison Finished for Trial {sheet_name} =====")
 
+def plot_activity_comparison(model, start_time_sec, end_time_sec,
+                             fps=10.0, max_neurons_to_plot=5,
+                             save_path=None, neuron_indices=None):
+    """
+    Plots simulated spike activity from SpikeCovarianceModel against actual data
+    for a specified time window and selected neurons.
+
+    Args:
+        model (SpikeCovarianceModel): Instance of the trained or untrained SpikeCovarianceModel.
+        start_time_sec (float): Start time for the plotting window (in seconds).
+        end_time_sec (float): End time for the plotting window (in seconds).
+        fps (float): Frames per second to convert time to data indices and for simulation.
+                     This should ideally match the fps inherent to the model's data and
+                     simulation setup (e.g., model.forward's fps argument).
+        max_neurons_to_plot (int): Maximum number of neurons to plot if neuron_indices is None.
+                                   If 0 or None, attempts to plot all (up to a hard cap for very large N).
+        save_path (str, optional): Path to save the figure. If None, displays the plot.
+        neuron_indices (list or np.array, optional): Specific neuron indices to plot.
+                                                    Overrides max_neurons_to_plot.
+    """
+    if not isinstance(model, SpikeCovarianceModel):
+        print("Error: Provided model is not an instance of SpikeCovarianceModel.")
+        return
+
+    # Ensure model is in evaluation mode for consistent simulation
+    model.eval()
+    if hasattr(model, 'simulator') and model.simulator is not None:
+        model.simulator.eval()
+    else:
+        print("Warning: model.simulator not found or is None. Cannot simulate.")
+        return
+
+    # 1. Determine indices and slice actual target data
+    start_idx = int(start_time_sec * fps)
+    end_idx = int(end_time_sec * fps)
+
+    if not (0 <= start_idx < end_idx <= model.target_spikes_N_T.shape[1]):
+        print(f"Error: Invalid time range or fps. "
+              f"Requested indices [{start_idx}:{end_idx}] are out of bounds "
+              f"for target data with {model.target_spikes_N_T.shape[1]} time points. "
+              f"Max time: {model.target_spikes_N_T.shape[1]/fps:.2f}s at {fps} fps.")
+        return
+
+    actual_activity_segment_np = model.target_spikes_N_T[:, start_idx:end_idx].cpu().numpy()
+    num_time_points_segment = actual_activity_segment_np.shape[1]
+
+    if num_time_points_segment == 0:
+        print("Error: Selected time segment results in zero time points for plotting.")
+        return
+
+    # 2. Prepare and run simulation for the specified segment
+    # Use the actual activity at the start of the segment as the initial condition for this simulation
+    initial_condition_sim = model.target_spikes_N_T[:, start_idx].clone().detach()
+
+    sim_duration_sec = end_time_sec - start_time_sec
+    sim_t_span_for_plot = (0, sim_duration_sec) # Simulate from t=0 for this segment's duration
+
+    simulated_activity_segment_np = None
+    time_vector_sim_shifted = None
+
+    with torch.no_grad():
+        try:
+            # Directly use the simulator for controlled simulation length
+            # FiringRateSimulator.simulate(t_span, x0, time_steps)
+            t_sim_relative, sim_states_T_B_N = model.simulator.simulate(
+                t_span=sim_t_span_for_plot,
+                x0=initial_condition_sim,
+                time_steps=num_time_points_segment # Match number of points in actual segment
+            )
+            simulated_activity_segment_np = sim_states_T_B_N.squeeze(1).permute(1,0).cpu().numpy()
+            time_vector_sim_shifted = t_sim_relative.cpu().numpy() + start_time_sec # Shift sim time to actual window
+        except Exception as e:
+            print(f"Error during simulation for plotting: {e}")
+            import traceback
+            traceback.print_exc()
+            # Continue to plot actual data if simulation fails
+            pass
+
+
+    # 3. Time vector for plotting actual data
+    # If simulation failed, t_sim_relative might not be defined, so create one for actual data
+    if time_vector_sim_shifted is None:
+        time_vector_actual = np.linspace(start_time_sec, end_time_sec, num_time_points_segment, endpoint=True)
+    else: # Use the time vector from simulation (shifted) for consistency if available
+        time_vector_actual = time_vector_sim_shifted
+
+
+    # 4. Select neurons to plot
+    total_neurons_available = model.n_neurons
+    if neuron_indices is not None:
+        indices_to_plot = np.array(neuron_indices)
+        if np.any(indices_to_plot >= total_neurons_available) or np.any(indices_to_plot < 0):
+            print(f"Error: Provided neuron_indices are out of bounds (0 to {total_neurons_available-1}).")
+            return
+        num_to_plot = len(indices_to_plot)
+    elif max_neurons_to_plot is not None and max_neurons_to_plot > 0 and max_neurons_to_plot < total_neurons_available:
+        indices_to_plot = np.arange(min(max_neurons_to_plot, total_neurons_available))
+        num_to_plot = len(indices_to_plot)
+    else: # Plot all or a capped number if too many
+        hard_cap_plot_all = 25 # Avoid plotting thousands of neurons by default
+        num_to_plot_all = min(total_neurons_available, hard_cap_plot_all)
+        indices_to_plot = np.arange(num_to_plot_all)
+        num_to_plot = len(indices_to_plot)
+        if total_neurons_available > hard_cap_plot_all and (max_neurons_to_plot is None or max_neurons_to_plot == 0):
+             print(f"Plotting the first {hard_cap_plot_all} out of {total_neurons_available} neurons. "
+                   f"Use 'max_neurons_to_plot' or 'neuron_indices' for more control.")
+
+
+    if num_to_plot == 0:
+        print("No neurons selected or available for plotting.")
+        return
+
+    # 5. Create plots
+    ncols = int(math.ceil(math.sqrt(num_to_plot)))
+    nrows = int(math.ceil(num_to_plot / ncols))
+    
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.5, nrows * 3), sharex=True, squeeze=False)
+    axes_flat = axes.flatten()
+
+    for i, neuron_idx_in_model in enumerate(indices_to_plot):
+        ax = axes_flat[i]
+        
+        # Ensure neuron_idx_in_model is valid for actual_activity_segment_np
+        if neuron_idx_in_model < actual_activity_segment_np.shape[0]:
+            ax.plot(time_vector_actual, actual_activity_segment_np[neuron_idx_in_model, :], label='Actual Data', color='dodgerblue', alpha=0.9)
+        else:
+            print(f"Warning: Neuron index {neuron_idx_in_model} out of bounds for actual data plotting.")
+
+        if simulated_activity_segment_np is not None and neuron_idx_in_model < simulated_activity_segment_np.shape[0]:
+            ax.plot(time_vector_sim_shifted if time_vector_sim_shifted is not None else time_vector_actual, # Use sim time if available
+                    simulated_activity_segment_np[neuron_idx_in_model, :],
+                    label='Simulated Model', color='orangered', linestyle='--', alpha=0.85)
+        
+        ax.set_title(f'Neuron {neuron_idx_in_model}', fontsize=10)
+        ax.set_ylabel('Activity', fontsize=8)
+        if i // ncols == nrows - 1 or (i // ncols == nrows - 2 and i + ncols >= num_to_plot) : # If it's in the effectively last row of plots
+             ax.set_xlabel('Time (s)', fontsize=8)
+        ax.legend(fontsize='x-small')
+        ax.grid(True, linestyle=':', alpha=0.5)
+        ax.tick_params(axis='both', which='major', labelsize=7)
+
+
+    # Hide any unused subplots
+    for j_ax in range(num_to_plot, nrows * ncols):
+        axes_flat[j_ax].set_visible(False)
+
+    fig.suptitle(f'Simulated vs Actual (Fish {model.fish_id})\nTime: {start_time_sec:.2f}s - {end_time_sec:.2f}s ({fps} FPS) - {save_path}', fontsize=14)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+        print(f"Activity comparison plot saved to {save_path}")
+        plt.close(fig)
+    else:
+        plt.show()
