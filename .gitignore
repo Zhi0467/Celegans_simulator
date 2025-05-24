@@ -1,6 +1,7 @@
 data/
-
+neuro/
 figs/
+fish-figs/
 
 checkpoints/
 # macOS system files

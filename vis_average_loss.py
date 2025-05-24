@@ -104,4 +104,4 @@ def load_and_average_metrics(trial_x, base_dir='checkpoints', num_runs=10, epoch
 
     plt.suptitle(f"Training Statistics on Trial {trial_x} Average over {num_runs} runs")
     plt.tight_layout()
-    plt.show()
+    plt.savefig(f'avg_loss_trial_{trial_x}_with_num_runs_{num_runs}.png')

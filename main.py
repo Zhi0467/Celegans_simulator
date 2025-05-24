@@ -12,7 +12,7 @@ but everything else is tune-able.
 """
 
 from pathlib import Path
-from trial_pca import *
+from model import *
 from vis_average_loss import load_and_average_metrics
 from vis_average_pc import average_pc_trajectories
 
@@ -158,5 +158,75 @@ def main():
 
     print("\nPipeline finished.")
 
+# --- New function to run the SpikeCovarianceModel ---
+def run_spike_covariance_experiment():
+    """
+    Runs a training experiment for the SpikeCovarianceModel.
+    """
+    print("\n===== Starting Spike Covariance Model Experiment =====")
+
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else
+                         ('mps' if torch.backends.mps.is_available() else 'cpu'))
+    print(f"Using device: {device}")
+
+    # Parameters for the SpikeCovarianceModel experiment
+    fish_id = '201106'  # Example fish ID, ensure data exists for this ID
+    fish_figs_dir = 'fish-figs/'
+    sequence_length = 1000 # Number of timepoints for simulation and target data
+    n_neurons = None
+    learning_rate = 5e-2 # Adjusted learning rate
+    num_epochs = 200
+
+    beta_init = 1.0
+    tau_init = 1.0
+    noise_strength = 1e-3 
+    weight_scale = 2.0
+
+    print(f"Experiment Parameters:")
+    print(f"  Fish ID: {fish_id}")
+    print(f"  Sequence Length: {sequence_length}")
+    print(f"  Number of Neurons: {n_neurons}")
+    print(f"  Learning Rate: {learning_rate}")
+    print(f"  Epochs: {num_epochs}")
+    print(f"  Beta Init: {beta_init}, Tau Init: {tau_init}, Noise: {noise_strength}")
+    print("-" * 30)
+
+    # Instantiate the SpikeCovarianceModel
+    try:
+        model = SpikeCovarianceModel(
+            fish_id=fish_id,
+            sequence_length=sequence_length,
+            beta_init=beta_init,
+            tau_init=tau_init,
+            noise_strength=noise_strength,
+            weight_scale=weight_scale,
+            learning_rate=learning_rate,
+            device=device,
+            n_neurons=n_neurons
+        )
+        print("SpikeCovarianceModel instantiated successfully.")
+    except Exception as e:
+        print(f"Error instantiating SpikeCovarianceModel: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    # Train the model
+    print("Starting training...")
+    try:
+        training_history = model.fit(
+            n_epochs=num_epochs,
+            save_path_prefix=fish_figs_dir
+        )
+        print("Training finished.")
+
+    except Exception as e:
+        print(f"Error during model training: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("===== Spike Covariance Model Experiment Finished =====")
+
 if __name__ == "__main__":
-    main()
+    run_spike_covariance_experiment()

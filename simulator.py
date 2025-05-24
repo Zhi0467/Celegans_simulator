@@ -28,40 +28,40 @@ class ODESimulator(nn.Module):
         - differentiable: if True, use torchdiffeq for simulation; if False, use scipy's solve_ivp
         """
         super().__init__()
-        self.differentiable = differentiable
         
         # Set device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 
                                   ('mps' if torch.backends.mps.is_available() else 'cpu'))
-        
-        # Use load_synaptic_data to get matrices and neuron_index
-        matrices, neuron_index = load_synaptic_data()
-        
-        # Create neuron_names from neuron_index to ensure matching order
-        self.neuron_names = list(neuron_index.keys())
-        
-        # Get W from 'EJ' matrix type
-        W_np = matrices['EJ']
-        self.W = torch.tensor(W_np, dtype=torch.float32, device=self.device)
-        self.initial_W = self.W.clone().detach()
+        if connectome_path is not None:
+            # Use load_synaptic_data to get matrices and neuron_index
+            self.differentiable = differentiable
+            matrices, neuron_index = load_synaptic_data()
+            
+            # Create neuron_names from neuron_index to ensure matching order
+            self.neuron_names = list(neuron_index.keys())
+            
+            # Get W from 'EJ' matrix type
+            W_np = matrices['EJ']
+            self.W = torch.tensor(W_np, dtype=torch.float32, device=self.device)
+            self.initial_W = self.W.clone().detach()
 
-        # Get A from 'S' matrix type
-        A_np = matrices['S']
-        self.A = torch.tensor(A_np, dtype=torch.float32, device=self.device)  
-        self.initial_A = self.A.clone().detach()    
-        
-        self.n_units = len(self.neuron_names)
+            # Get A from 'S' matrix type
+            A_np = matrices['S']
+            self.A = torch.tensor(A_np, dtype=torch.float32, device=self.device)  
+            self.initial_A = self.A.clone().detach()    
+            
+            self.n_units = len(self.neuron_names)
 
-        
-        # Get core neurons from Kato data
-        self.sheet_name = sheet_name
-        self.core_traces, self.core_traces_dif, neuron_ids, self.core_neuron_names, self.fps = load_kato_data(sheet_name=self.sheet_name)
-        #self.fps = round(self.fps, 4)  # Round fps to 2 decimal places
+            
+            # Get core neurons from Kato data
+            self.sheet_name = sheet_name
+            self.core_traces, self.core_traces_dif, neuron_ids, self.core_neuron_names, self.fps = load_kato_data(sheet_name=self.sheet_name)
+            #self.fps = round(self.fps, 4)  # Round fps to 2 decimal places
 
-        # Get indices of core neurons in the full network
-        self.core_indices = [self.neuron_names.index(n) for n in self.core_neuron_names 
-                           if n in self.neuron_names]
-        self.m_units = len(self.core_indices)
+            # Get indices of core neurons in the full network
+            self.core_indices = [self.neuron_names.index(n) for n in self.core_neuron_names 
+                            if n in self.neuron_names]
+            self.m_units = len(self.core_indices)
 
     def ode_func(self, t, x):
         """
@@ -569,6 +569,119 @@ class LinearDynamics(ODESimulator):
         # if 'beta_cubic' in checkpoint: self.beta_cubic = checkpoint['beta_cubic']
         print(f"Model loaded from {path}")
 
+class SpikeSimulator(ODESimulator):
+    def __init__(self, fish_id='201106',
+                 beta=1.0, tau=1.0,
+                 noise_strength=0.01,
+                 weight_scale=2.0,
+                 n_neurons = None):
+        """
+        Initialize the Spike Simulator
+        
+        Parameters:
+        - fish_id: ID of the fish data to load (default: '201106')
+        - beta: Coupling strength
+        - tau: Time constant
+        - noise_strength: Standard deviation of Gaussian noise
+        - weight_scale: Scale factor for random weight initialization
+        """
+        # Load fish spike data to get number of neurons
+        spike_data = load_fish_spike_data(ifish=fish_id, n_neurons=n_neurons)
+        n_units = spike_data.shape[0]  # Number of neurons from spike data
+        
+        # Initialize base class without connectome
+        super().__init__(connectome_path=None)
+        
+        # Override n_units from base class
+        self.n_units = n_units
+        
+        self.log_beta = nn.Parameter(torch.log(torch.tensor(beta, device=self.device)))
+        self.tau = nn.Parameter(torch.tensor(tau, dtype=torch.float32, device=self.device))
+        self.noise_strength = noise_strength
+        
+        # Initialize synaptic weights randomly
+        # Using Xavier/Glorot initialization scaled by weight_scale
+        self.W = nn.Linear(self.n_units, self.n_units, bias=False).to(self.device)
+        nn.init.xavier_normal_(self.W.weight, gain=weight_scale)
+        
+        # Store spike data for reference
+        self.spike_data = spike_data
+    
+    @property
+    def beta(self):
+        return torch.exp(self.log_beta)
+    
+    def sigma(self, x):
+        """Sigmoid activation function"""
+        return torch.relu(x)
+    
+    def ode_func(self, t, x):
+        """
+        Compute dx/dt for the spike-based system
+        """
+        if len(x.shape) == 1:
+            x = x.unsqueeze(0)
+        
+        # Compute synaptic input
+        synaptic_input = self.W(x)
+        
+        # Add noise if enabled
+        if self.noise_strength > 0:
+            noise = torch.randn_like(x) * self.noise_strength
+            synaptic_input = synaptic_input + noise
+        
+        # Compute membrane potential dynamics
+        dxdt = (-x + self.beta * self.sigma(synaptic_input)) / self.tau
+
+        dxdt = torch.clamp(dxdt, min=-1.0, max=1.0)
+        
+        return dxdt
+    
+    def simulate(self, t_span=None, x0=None, time_steps=None):
+        """
+        Simulate the dynamics using Euler integration
+        """
+        if x0 is None:
+            # Initialize x0 uniformly between -1 and 1
+            x0 = 2 * torch.rand(1, self.n_units, device=self.device) - 1
+        
+        # Ensure x0 has batch dimension
+        if len(x0.shape) == 1:
+            x0 = x0.unsqueeze(0)
+        
+        # Use explicit time_steps if provided, otherwise calculate from t_span and alpha
+        if time_steps is None:
+            return None
+        
+        # Generate evenly spaced time points - exactly time_steps points
+        t = torch.linspace(t_span[0], t_span[1], time_steps, device=self.device)
+        step_size = (t[1] - t[0]).item() 
+
+        states_list = [x0]
+        current_state = x0
+
+        # Euler integration loop
+        for i in range(time_steps - 1):
+            # Calculate derivative using the *current* state
+            dxdt = self.ode_func(t[i], current_state) 
+
+            # Calculate the *next* state without modifying the list or current_state yet
+            next_state = current_state + step_size * dxdt 
+
+            # Check for NaN values and handle them (replace with previous state)
+            if torch.isnan(next_state).any():
+                print(f"NaN detected at simulation step {i+1}. Replacing with previous state.")
+                # Keep current_state as next_state effectively
+                next_state = current_state
+
+            # Append the newly computed state to the list
+            states_list.append(next_state)
+            # Update current_state for the next iteration
+            current_state = next_state
+
+        states = torch.stack(states_list, dim=0)
+        return t, states
+
 class KatoDataset(torch.utils.data.Dataset):
     """Dataset class for Kato et al. neural activity data"""
     def __init__(self, sequence_length, n_units, alpha, zoomin_factor = None, normalize=True, sheet_name = 0):
@@ -635,143 +748,13 @@ class KatoDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return self.traces, self.weights
 
-class CelegansSimulator(ODESimulator):
-    def __init__(self, connectome_path='data/connectome/White1986', 
-                 tau=0.2, beta=5.0, d_i=0.0, differentiable=True):
-        """
-        Initialize the C. elegans neural simulator
-        
-        Parameters:
-        - connectome_path: path to the gap junction (EJ) connectivity matrix
-        - tau: time constant
-        - beta: coupling strength for gap junctions
-        - d_i: bias term in the nonlinear function
-        - differentiable: if True, use torchdiffeq for simulation; if False, use scipy's solve_ivp
-        """
-        super().__init__(differentiable)
-        
-        # The neuron_names, W, and A matrices are now loaded in the parent class (ODESimulator)
-        # using load_synaptic_data
-        
-        # Initialize parameters with proper tensor construction
-        self.tau = torch.tensor(tau, dtype=torch.float32, device=self.device).detach().clone().requires_grad_(True)
-        self.beta = torch.tensor(beta, dtype=torch.float32, device=self.device).detach().clone().requires_grad_(True)
-        self.d_i = torch.tensor(d_i, dtype=torch.float32, device=self.device).detach().clone().requires_grad_(True)
-    
-    def f_i(self, x):
-        """
-        Nonlinear function f_i(x_i) = -2(x_i + 0.8)(x_i - 0.1)(x_i - 1) + d_i
-        Vectorized implementation with PyTorch
-        """
-        return -2 * (x + 0.8) * (x - 0.1) * (x - 1) + self.d_i
-    
-    def sigma(self, x):
-        """
-        ReLU activation function
-        """
-        return torch.relu(x) if self.differentiable else np.maximum(0, x)
-    
-    def ode_func(self, t, x):
-        """
-        Compute dx/dt for all neurons using PyTorch operations
-        
-        Parameters:
-        - t: time (required for torchdiffeq)
-        - x: state vector
-        
-        Returns:
-        - dxdt: vector of derivatives
-        """
-        if self.differentiable:
-            # Gap junction term: β∑W_ij(x_j - x_i)
-            x_diff_matrix = x.reshape(-1, 1) - x.reshape(1, -1)  # x_j - x_i for all pairs
-            gap_junction_term = self.beta * torch.sum(self.W * x_diff_matrix, dim=1)
-        else:
-            # Gap junction term: β∑W_ij(x_j - x_i)
-            x_diff_matrix = x.reshape(-1, 1) - x.reshape(1, -1)  # x_j - x_i for all pairs
-            gap_junction_term = self.beta * np.sum(self.W * x_diff_matrix, axis=1)
-        # Chemical synapse term: ∑A_ij σ(x_j)
-        chemical_term = self.A @ self.sigma(x)
-        
-        # Intrinsic dynamics term: f_i(x_i)
-        intrinsic_term = self.f_i(x)
-        return (intrinsic_term + gap_junction_term + chemical_term) / self.tau
-    
-    def simulate_and_sample(self, zoomin_factor=10.0, method='dopri5'):
-        """
-        Simulate dynamics and sample at specified rate to match experimental data
-        
-        Parameters:
-        - zoomin_factor: factor to increase simulation resolution
-        - method: ODE solver method
-        
-        Returns:
-        - t_sampled: sampled timepoints
-        - X_core_sampled: sampled core neuron activity
-        - X_full_sampled: sampled full network activity
-        """
-        frames_per_second = self.fps
-        total_frames = self.core_traces.shape[1]
-        dt = (1 / frames_per_second) / zoomin_factor
-        
-        # Calculate total simulation time needed
-        total_time = total_frames / frames_per_second
-        
-        # Initialize random initial conditions if not provided
-        x0 = torch.rand(self.n_neurons, device=self.device)
-        
-        # Simulate with fine timestep
-        t, X_full = self.simulate(
-            t_span=(0, total_time),
-            x0=x0,
-            dt=dt,
-            method=method
-        )
-        
-        # Extract core neuron dynamics and transpose
-        X_full = X_full.transpose(0, 1)  # Shape: (n_neurons, n_timepoints)
-        X_core = X_full[self.core_indices, :]
-        
-        # Calculate sampling indices
-        sample_indices = torch.arange(0, len(t), int(zoomin_factor), device=self.device)[:total_frames]
-        
-        # Sample the data
-        t_sampled = t[sample_indices]
-        X_core_sampled = X_core[:, sample_indices]
-        X_full_sampled = X_full[:, sample_indices]
-        
-        print(f"Simulation sampled at {frames_per_second} Hz for {total_frames} frames")
-        print(f"Original simulation points: {len(t)}")
-        print(f"Sampled points: {len(t_sampled)}")
-        
-        return t_sampled, X_core_sampled, X_full_sampled
-
 
 def main():
     # Initialize model
-    simulator = LinearDynamics(
-        connectome_path='data/connectome/White1986',
-        beta=5.0,
-        tau=10.0,
-        zoomin_factor=5
-    )
-    seq_len = 20
-    checkpoint_path = f'models/checkpoints_{seq_len}'
-    resume_from = None
-    #resume_from=f'models/checkpoints_{seq_len}_current.pt'
-
-    # Train model with checkpoints
-    train_losses, test_losses = simulator.fit(
-        n_epochs=500,
-        learning_rate=1e-1,
-        sequence_length=seq_len,
-        checkpoint_path=checkpoint_path,
-        checkpoint_frequency=10,
-        resume_from=resume_from  
-    )
-    save_path = f'figs/training_results_{seq_len}.png'
-    # Plot results
-    simulator.plot_loss_history(train_losses, test_losses, save_path=save_path)
-
+    simulator = SpikeSimulator()
+    time_span = (0.0, 0.1)
+    steps = 3
+    t, states = simulator.simulate(t_span=time_span, time_steps=steps)
+   
 if __name__ == "__main__":
     main() 

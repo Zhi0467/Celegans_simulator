@@ -19,7 +19,7 @@ import torch
 from sklearn.decomposition import PCA
 from torch import nn
 import matplotlib.pyplot as plt
-from simulator import LinearDynamics
+from simulator import LinearDynamics, SpikeSimulator
 import torch.nn.functional as F
 from load import *
 import torch.optim.lr_scheduler as lr_scheduler
@@ -1500,6 +1500,340 @@ class TrialPCA(nn.Module):
             plt.close(fig)
         else:
             plt.show()
+
+class FishSpikeDataset(torch.utils.data.Dataset):
+    """
+    Dataset for loading fish spike data for covariance-based model fitting.
+    Uses load_fish_spike_data from load.py.
+    """
+    def __init__(self, fish_id='201106', sequence_length=None, device='cpu', n_neurons = None):
+        super().__init__()
+        self.fish_id = fish_id
+        self.device = device
+        
+        # Load data using the function from load.py
+        # load_fish_spike_data returns a numpy array (neurons, timepoints)
+        self.raw_spike_data_np = load_fish_spike_data(ifish=self.fish_id, n_neurons=n_neurons)
+        self.n_neurons, self.total_timepoints = self.raw_spike_data_np.shape
+
+        if sequence_length is None:
+            self.sequence_length = self.total_timepoints
+        else:
+            self.sequence_length = min(sequence_length, self.total_timepoints)
+
+        # Use the first 'sequence_length' timepoints
+        self.spike_data_np = self.raw_spike_data_np[:, :self.sequence_length]
+        self.spike_data = torch.tensor(self.spike_data_np, dtype=torch.float32, device=self.device)
+
+        self.x0 = torch.zeros(1, self.n_neurons, dtype=torch.float32, device=device)
+        for i in range(self.n_neurons):
+            self.x0[0, i] = self.spike_data[i, 0]
+
+    def __len__(self):
+        # This dataset handles a single sequence chunk.
+        return 1
+
+    def __getitem__(self, idx):
+        # Returns the spike data chunk: (neurons, timepoints)
+        if idx >= 1:
+            raise IndexError("This dataset currently only supports a single sequence chunk.")
+        return self.spike_data
+
+    def get_full_data(self):
+        """Helper to get the processed spike data tensor."""
+        return self.spike_data
+
+class SpikeCovarianceModel(nn.Module):
+    """
+    A minimal model that wraps SpikeSimulator and trains its parameters
+    by fitting the covariance matrix of simulated spike activity to a target
+    covariance matrix derived from fish spike data.
+    """
+    def __init__(self, fish_id='201106', sequence_length=1000,
+                 beta_init=1.0, tau_init=5.0, noise_strength=0.1, weight_scale=1.0,
+                 learning_rate=0.01, device=None, n_neurons = None):
+        super().__init__()
+
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else
+                                      ('mps' if torch.backends.mps.is_available() else 'cpu'))
+        else:
+            self.device = device
+        
+        print(f"SpikeCovarianceModel using device: {self.device}")
+
+        self.fish_id = fish_id
+        # sequence_length determines the number of time points for simulation and target data
+        self.sequence_length = sequence_length 
+
+        # Initialize dataset
+        self.dataset = FishSpikeDataset(fish_id=self.fish_id,
+                                        sequence_length=self.sequence_length,
+                                        device=self.device,
+                                        n_neurons=n_neurons)
+        
+        self.n_neurons = self.dataset.n_neurons
+
+        self.simulator = SpikeSimulator(fish_id=self.fish_id,
+                                        beta=beta_init,
+                                        tau=tau_init,
+                                        noise_strength=noise_strength,
+                                        weight_scale=weight_scale,
+                                        n_neurons=n_neurons).to(self.device)
+        
+        # Validate neuron count consistency
+        if self.simulator.n_units != self.n_neurons:
+            raise ValueError(
+                f"Mismatch in neuron count: Dataset has {self.n_neurons}, "
+                f"Simulator (from fish_id {self.fish_id}) initialized with {self.simulator.n_units}."
+            )
+
+        # Get target spike data and pre-calculate target covariance matrix
+        self.target_spikes_N_T = self.dataset.get_full_data() # Shape: (n_neurons, sequence_length)
+        self.target_cov = self._calculate_covariance(self.target_spikes_N_T)
+        self.target_corr = self._calculate_correlation(self.target_spikes_N_T)
+
+        # Optimizer for the simulator's parameters
+        self.optimizer = torch.optim.Adam(self.simulator.parameters(), lr=learning_rate)
+
+    def forward(self, x0_N=None, t_span=None, fps = 10.0):
+        """
+        Runs the simulation using the SpikeSimulator.
+
+        Args:
+            x0_N (Tensor, optional): Initial condition for neurons. Shape (n_neurons,).
+                                     If None, simulator's default is used.
+            t_span (tuple, optional): (start_time, end_time) for simulation.
+            time_steps (int, optional): Number of simulation steps.
+
+        Returns:
+            Tensor: Simulated spike states from the simulator. Shape (time_steps, batch_size, n_neurons).
+        """
+        if x0_N is not None:
+            # Add batch dimension for simulator: (1, n_neurons)
+            x0_sim = x0_N.unsqueeze(0).to(self.device) 
+        else:
+            x0_sim = None # SpikeSimulator handles default x0 if None
+
+        time_steps = self.sequence_length
+
+        t_start = 0.0
+        t_end = time_steps / fps
+        t_span = (t_start, t_end) 
+        
+        # SpikeSimulator.simulate returns t, states
+        # states shape: (time_steps, batch_size, n_units)
+        _t, simulated_spikes_T_B_N = self.simulator.simulate(t_span=t_span,
+                                                             x0=x0_sim,
+                                                             time_steps=time_steps)
+        return simulated_spikes_T_B_N
+
+    def fit(self, save_path_prefix = None, n_epochs=100, x0_N=None):
+        """
+        Trains the model by fitting the simulated covariance to the target covariance.
+
+        Args:
+            n_epochs (int): Number of training epochs.
+            x0_N (Tensor, optional): Initial condition for simulations. Shape (n_neurons,).
+                                     If None, uses the first time point of target data.
+        Returns:
+            dict: Training history containing loss per epoch.
+        """
+        if x0_N is None:
+            initial_condition_N = self.target_spikes_N_T[:, 0].clone().detach()
+        else:
+            initial_condition_N = x0_N.to(self.device) # Ensure it's on the correct device
+
+        self.simulator.eval() 
+        with torch.no_grad():
+            sim_spikes_before = self.forward(x0_N=initial_condition_N)
+            sim_spikes_before_N_T = sim_spikes_before.squeeze(1).permute(1, 0)
+            sim_corr_before_training = self._calculate_correlation(sim_spikes_before_N_T)
+
+        self.train()
+        self.simulator.train()
+        training_history = {'loss': []}
+
+        for epoch in range(n_epochs):
+            self.optimizer.zero_grad()
+
+            # Run simulation
+            simulated_spikes_T_B_N = self.forward(x0_N=initial_condition_N)
+            
+            simulated_spikes_N_T = simulated_spikes_T_B_N.squeeze(1).permute(1, 0)
+
+            # Calculate covariance of simulated data
+            simulated_cov = self._calculate_covariance(simulated_spikes_N_T)
+
+            # Loss: MSE between target and simulated covariance matrices
+            loss = F.mse_loss(simulated_cov, self.target_cov)
+
+            if torch.isnan(loss):
+                print(f"Epoch {epoch+1}: NaN loss detected. Stopping training.")
+                break 
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.simulator.parameters(), max_norm=1.0)
+            self.optimizer.step()
+
+            training_history['loss'].append(loss.item())
+            if (epoch + 1) % 1== 0 or epoch == 0 or epoch == n_epochs -1 :
+                print(f"Epoch {epoch+1}/{n_epochs}, Loss: {loss.item():.12f}")
+        
+                
+        self.simulator.eval() 
+        with torch.no_grad():
+            sim_spikes_after = self.forward(x0_N=initial_condition_N)
+            sim_spikes_after_N_T = sim_spikes_after.squeeze(1).permute(1, 0)
+            sim_corr_after_training = self._calculate_correlation(sim_spikes_after_N_T)
+
+        if save_path_prefix:
+            save_dir = Path(save_path_prefix)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            loss_plot_path = str(save_dir / "loss_progression.png")
+            cov_plot_path = str(save_dir / "covariance_heatmaps.png")
+        else:
+            loss_plot_path = None
+            cov_plot_path = None
+
+        self.plot_loss_progression(training_history['loss'], save_path=loss_plot_path)
+        self.plot_covariance_heatmaps(
+            actual_cov=self.target_corr, 
+            sim_cov_before=sim_corr_before_training,
+            sim_cov_after=sim_corr_after_training,
+            save_path=cov_plot_path
+        )
+
+        return training_history
+#---------------------------HELPERS----------------------------
+    def _calculate_covariance(self, data_N_T):
+        if data_N_T.shape[1] < 2: # torch.cov requires at least 2 observations
+            print("Warning: Not enough timepoints (<2) to calculate covariance. Returning zero matrix.")
+            return torch.zeros((data_N_T.shape[0], data_N_T.shape[0]), device=self.device, dtype=data_N_T.dtype)
+        # torch.cov expects observations as columns, features (neurons) as rows.
+        return torch.cov(data_N_T)
+
+    def _calculate_correlation(self, neural_activity_M_Tsim, epsilon=1e-8):
+        if neural_activity_M_Tsim.shape[0] == 0: # No observed neurons
+            return np.zeros((0,0))
+
+        if neural_activity_M_Tsim.shape[1] < 2: # Need at least 2 timepoints
+            print("Warning: Less than 2 time points for covariance calculation. Returning zero matrix.")
+            return np.zeros((neural_activity_M_Tsim.shape[0], neural_activity_M_Tsim.shape[0]))
+
+        # All provided timepoints are considered valid
+        activity_at_frames_M_Tactual = neural_activity_M_Tsim
+
+        mean_activity = torch.mean(activity_at_frames_M_Tactual, dim=1, keepdim=True)
+        centered_activity = activity_at_frames_M_Tactual - mean_activity
+
+        n_actual_frames = activity_at_frames_M_Tactual.shape[1]
+        # This check is technically redundant if the one above (neural_activity_M_Tsim.shape[1] < 2) is passed,
+        # but kept for safety, though n_actual_frames will be >= 2 here.
+        if n_actual_frames <= 1: 
+            print("Warning: Not enough actual frames for std dev calculation (<=1). Returning zero matrix.")
+            return np.zeros((neural_activity_M_Tsim.shape[0], neural_activity_M_Tsim.shape[0]))
+
+        std_activity = torch.std(activity_at_frames_M_Tactual, dim=1, keepdim=True, unbiased=True) 
+        standardized_activity = centered_activity / (std_activity + epsilon)
+        
+        covariance_matrix = torch.matmul(standardized_activity, standardized_activity.t()) / (n_actual_frames - 1)
+        
+        return covariance_matrix.cpu().detach().numpy()
+
+    def plot_loss_progression(self, loss_history, save_path=None):
+        if not loss_history:
+            print("No loss history to plot.")
+            return
+        plt.figure(figsize=(10, 6))
+        plt.plot(loss_history, label='Covariance MSE Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title(f'Training Loss Progression (Fish {self.fish_id})')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        try:
+            plt.yscale('log') 
+        except ValueError: pass 
+        if save_path:
+            plt.savefig(save_path)
+            print(f"Loss progression plot saved to {save_path}")
+            plt.close()
+        else:
+            plt.show()
+
+    def plot_covariance_heatmaps(self, actual_cov, sim_cov_before, sim_cov_after, save_path=None):
+            """
+            Plots three neural covariance matrices as heatmaps in a single figure.
+            Args:
+                actual_cov (np.ndarray): The actual neural covariance matrix.
+                sim_cov_before (np.ndarray): Simulated neural covariance matrix before training.
+                sim_cov_after (np.ndarray): Simulated neural covariance matrix after training.
+                save_path (str, optional): Path to save the figure.
+            """
+            if actual_cov is None or sim_cov_before is None or sim_cov_after is None :
+                print("Warning: One or more covariance matrices are None. Skipping heatmap plotting.")
+                if actual_cov is not None and actual_cov.shape == (0,0): 
+                    print("No observed neurons to plot covariance for.")
+                return
+            if actual_cov.shape[0] == 0: 
+                print("No observed neurons to plot covariance for.")
+                return
+
+            fig, axes = plt.subplots(1, 3, figsize=(18, 5.5)) 
+            vmins, vmaxs = [], []
+            all_matrices = [m for m in [actual_cov, sim_cov_before, sim_cov_after] if m is not None and m.size > 0]
+
+            if not all_matrices:
+                print("No valid covariance matrices to plot.")
+                plt.close(fig) 
+                return
+
+            for cov_matrix in all_matrices:
+                finite_vals = cov_matrix[np.isfinite(cov_matrix)]
+                if finite_vals.size > 0:
+                    vmins.append(np.min(finite_vals))
+                    vmaxs.append(np.max(finite_vals))
+            
+            vmin = min(vmins) if vmins else -1 
+            vmax = max(vmaxs) if vmaxs else 1
+            if vmin == vmax : 
+                vmin -= 0.5
+                vmax += 0.5
+            if not (np.isfinite(vmin) and np.isfinite(vmax)):
+                vmin, vmax = -1, 1
+
+            titles = [
+                f'Target Covariance (Fish {self.fish_id})', 
+                'Simulated Cov (Before Training)',
+                'Simulated Cov (After Training)'
+            ]
+            matrices_to_plot = [actual_cov, sim_cov_before, sim_cov_after]
+
+            for i, ax in enumerate(axes):
+                if matrices_to_plot[i] is not None and matrices_to_plot[i].size > 0:
+                    im = ax.imshow(matrices_to_plot[i], aspect='auto', cmap='plasma', vmin=vmin, vmax=vmax) 
+                    fig.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04) 
+                    ax.set_title(titles[i], fontsize=10) 
+                    ax.set_xlabel("Neuron Index", fontsize=8) 
+                    if i == 0:
+                        ax.set_ylabel("Neuron Index", fontsize=8) 
+                    ax.tick_params(axis='both', which='major', labelsize=7) 
+                else:
+                    ax.set_title(f"{titles[i]}\n(Not Available)", fontsize=10)
+                    ax.text(0.5, 0.5, 'N/A', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+            
+            fig.suptitle(f'Covariance Matrix Comparison (Fish {self.fish_id})', fontsize=12, y=0.99)
+            plt.tight_layout(rect=[0, 0, 1, 0.95]) 
+
+            if save_path:
+                plt.savefig(save_path, dpi=150) 
+                print(f"Covariance heatmaps saved to {save_path}")
+                plt.close(fig)
+            else:
+                plt.show()
 
 # -----------------------------HELPER METHODS----------------------------    
 def load_identified_data(data_dir='data/activity/WT_NoStim', sheet_name=0, 

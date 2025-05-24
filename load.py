@@ -12,6 +12,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 import math # For ceil
 import matplotlib.pyplot as plt
+import scipy.io
 
 def gaussian_smooth(data, sigma=1.0):
     """
@@ -744,3 +745,71 @@ def load_full_neural_data(data_dir='data/activity/WT_NoStim', sheet_name=0, smoo
         gc.collect()
         torch.mps.empty_cache()
     return permuted_traces, traces_dif, neuron_ids, fps
+
+def load_fish_spike_data(dataroot = 'data/activity/fish_data', ifish = '201106', n_neurons = None):
+    # Load Spike Data
+    spikedata_path = os.path.join(dataroot, str(ifish), "spike_OASIS.mat")
+    mat_data = scipy.io.loadmat(spikedata_path)
+    sMatrix_total = mat_data['sMatrix_total']
+
+    r = None  # Initialize r
+    judgedata_path = os.path.join(dataroot, str(ifish), "Judge.mat")
+
+    if os.path.isfile(judgedata_path):
+        judge_mat_data = scipy.io.loadmat(judgedata_path)
+        Judge = judge_mat_data['Judge']
+
+        judge_indices = None
+        if Judge.dtype == bool:
+            judge_indices = np.where(Judge.ravel())[0] # ravel() flattens, where gives tuple
+        else:
+            judge_indices = np.where(Judge.ravel() != 0)[0]
+
+        if Judge.size == sMatrix_total.shape[0]: # In Python, size gives total elements, shape[0] gives rows
+            r = sMatrix_total[judge_indices, :].astype(np.float32)
+        else:
+            r = sMatrix_total.astype(np.float32)
+    else:
+        # If Judge.mat doesn't exist, r should still be initialized from sMatrix_total
+        # as per the logic where if the first filtering isn't fully applied,
+        # the full sMatrix_total (converted to float32) is used.
+        r = sMatrix_total.astype(np.float32)
+
+
+    judgedata2_path = os.path.join(dataroot, str(ifish), "Judge2.mat")
+
+    if os.path.isfile(judgedata2_path):
+        judge2_mat_data = scipy.io.loadmat(judgedata2_path)
+        Judge2 = judge2_mat_data['Judge2']
+
+        judge2_indices = None
+        if Judge2.dtype == bool:
+            judge2_indices = np.where(Judge2.ravel())[0]
+        else:
+            judge2_indices = np.where(Judge2.ravel() != 0)[0]
+
+        # Ensure r is not None before trying to access its shape
+        if r is not None and Judge2.size == r.shape[0]:
+            r = r[judge2_indices, :]
+        # If r is None here, it means Judge.mat was not found and sMatrix_total wasn't processed.
+        # This case needs clarification from the original Julia logic if Judge.mat is absent
+        # but Judge2.mat is present. Assuming if Judge.mat is missing, sMatrix_total becomes r,
+        # and then Judge2 processing continues on that. This is handled by the 'else'
+        # block for the first 'if os.path.isfile(judgedata_path)'.
+
+    # If r is still None at this point (e.g., spikedata loaded, but Judge.mat and Judge2.mat were not found or conditions not met)
+    # and the intention is to always have 'firingrate' be based on 'sMatrix_total' if no filtering occurs,
+    # this line ensures 'r' is at least 'sMatrix_total' (converted).
+    # However, the Julia code implies 'r' is initialized based on the first filtering block.
+    # The Python code above tries to mimic this by initializing r after the first block.
+    if r is None and 'sMatrix_total' in locals(): # Check if sMatrix_total was loaded
+        r = sMatrix_total.astype(np.float32)
+
+
+    # firingrate = r[:, 6000:9000] # Python slicing is exclusive for the end index
+    if n_neurons is None:
+        firingrate = r
+    else:
+        firingrate = r[:n_neurons, :]
+    print(f'Fish Firing Rates Loaded. Shape {firingrate.shape}')
+    return firingrate

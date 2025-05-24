@@ -4,7 +4,7 @@ import torch
 import plotly.graph_objects as go
 import plotly.io as pio
 from tqdm import tqdm
-from trial_pca import *
+from model import *
 
 def average_pc_trajectories(trial_x, base_dir='checkpoints', num_runs=10, 
                            sequence_length=300, zoomin_factor=5, save_path=None):
